@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+build/
+dist/
+
+# Виртуальные окружения
+.venv/
+venv/
+
+# Тесты
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Редакторы/ОС
+.DS_Store
+.idea/
+.vscode/
