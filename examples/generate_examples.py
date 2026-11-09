@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import pymupdf
@@ -274,22 +275,79 @@ GENERATORS = {
     "problem.pdf": generate_problem,
 }
 
+#: Эталон (M4) для PDF с известной генератору топологией.
+GROUND_TRUTHS: dict[str, dict[str, object]] = {
+    "simple.pdf": {
+        "components": [
+            {"ref_designation": "F1", "type": "fuse", "page": 1},
+            {"ref_designation": "SB1", "type": "button", "page": 1},
+            {"ref_designation": "K1", "type": "relay", "page": 1},
+            {"ref_designation": "HL1", "type": "lamp", "page": 1},
+        ],
+        "nets": [
+            {
+                "name": "L1",
+                "component_refs": ["F1", "SB1", "K1", "HL1"],
+            },
+            {
+                "name": "N",
+                "component_refs": ["F1", "SB1", "K1", "HL1"],
+            },
+        ],
+    },
+    "multipage.pdf": {
+        "components": [
+            {"ref_designation": "R1", "type": "resistor", "page": 1},
+            {"ref_designation": "R2", "type": "resistor", "page": 2},
+        ],
+        "nets": [
+            {"name": "L1", "component_refs": ["R1", "R2"]},
+        ],
+    },
+}
+
+
+def ground_truth_path(pdf_path: str | Path) -> Path:
+    """Путь к ``*_ground_truth.json`` рядом с PDF."""
+    path = Path(pdf_path)
+    return path.with_name(f"{path.stem}_ground_truth.json")
+
+
+def _emit_ground_truth(pdf_path: Path) -> Path | None:
+    """Записывает ``ground_truth.json`` для PDF, если эталон известен.
+
+    Returns:
+        Путь к эталону или ``None`` (для ``problem.pdf`` эталона нет).
+    """
+    truth = GROUND_TRUTHS.get(pdf_path.name)
+    if truth is None:
+        return None
+    target = ground_truth_path(pdf_path)
+    target.write_text(
+        json.dumps(truth, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return target
+
 
 def generate_all(output_dir: str | Path) -> dict[str, Path]:
-    """Генерирует все эталонные PDF в ``output_dir``.
+    """Генерирует эталонные PDF и `ground_truth.json` рядом с ними.
 
     Args:
         output_dir: Каталог назначения.
 
     Returns:
-        Отображение «имя файла → путь».
+        Отображение «имя PDF → путь». Эталоны пишутся рядом как побочный
+        эффект (``simple_ground_truth.json``, ``multipage_ground_truth.json``).
     """
     directory = Path(output_dir)
     directory.mkdir(parents=True, exist_ok=True)
-    return {
-        name: generator(directory / name)
-        for name, generator in GENERATORS.items()
-    }
+    created: dict[str, Path] = {}
+    for name, generator in GENERATORS.items():
+        path = generator(directory / name)
+        created[name] = path
+        _emit_ground_truth(path)
+    return created
 
 
 def main(argv: list[str] | None = None) -> int:

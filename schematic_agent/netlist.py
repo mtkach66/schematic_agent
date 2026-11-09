@@ -18,11 +18,24 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Iterable
 
 import networkx as nx
 
-from .contract import Net
+from .config import get_settings
+from .contract import Issue, Net
+from .issues import default_action
+
+#: Всё, кроме латинских букв и цифр: удаляется при нормализации меток цепей.
+_NET_NON_ALNUM_RE = re.compile(r"[^A-Z0-9]")
+
+#: Уверенность слияния по точному имени.
+CONFIDENCE_EXACT = 1.0
+#: Уверенность слияния по нормализованному имени (``L1`` ↔ ``L1 ``).
+CONFIDENCE_NORMALIZED = 0.9
+#: Уверенность слияния по синониму (``PE`` ↔ ``PEN``).
+CONFIDENCE_ALIAS = 0.7
 
 #: Ключ атрибута компонента со списком индексов его примитивов.
 _PRIMITIVES_KEY = "primitive_indices"
@@ -151,46 +164,181 @@ def build_netlist(
             )
         )
 
-    merged = merge_nets(nets)
+    aliases: dict[str, str] = {}
+    try:
+        from .components import load_net_aliases
+
+        aliases = load_net_aliases()
+    except Exception:  # noqa: BLE001 - синонимы не должны ломать netlist
+        aliases = {}
+    merged, merge_issues = merge_nets(nets, aliases=aliases)
     for index, net in enumerate(merged, start=1):
         net.id = f"net{index:03d}"
-    return merged, []
+    return merged, merge_issues
 
 
-def merge_nets(nets: list[Net]) -> list[Net]:
-    """Объединяет цепи с одинаковым именем (сквозные метки, Т8).
+def normalize_net_label(label: str) -> str:
+    """Нормализует метку цепи для нечёткого сопоставления (M2).
+
+    Верхний регистр и удаление всех символов кроме ``[A-Z0-9]``:
+    ``"l-1"`` → ``"L1"``, ``"L1 "`` → ``"L1"``, ``"PEN"`` → ``"PEN"``.
+    Исходное имя цепи не изменяется — нормализуется только ключ сравнения.
+
+    Args:
+        label: Исходная метка.
+
+    Returns:
+        Нормализованный ключ (может быть пустым).
+    """
+    return _NET_NON_ALNUM_RE.sub("", str(label or "").upper())
+
+
+def _canonical_net_label(label: str, aliases: dict[str, str] | None) -> str:
+    """Возвращает каноническую метку с учётом таблицы синонимов."""
+    normalized = normalize_net_label(label)
+    if not normalized:
+        return ""
+    return (aliases or {}).get(normalized, normalized)
+
+
+def _absorb_net(target: Net, source: Net) -> None:
+    """Переносит узлы, связи, выводы и метки одной цепи в другую."""
+    for node_id in source.nodes:
+        if node_id not in target.nodes:
+            target.nodes.append(node_id)
+    for connection in source.connections:
+        if connection not in target.connections:
+            target.connections.append(connection)
+    for pair in source.component_pins:
+        if pair not in target.component_pins:
+            target.component_pins.append(pair)
+    for label in source.text_labels:
+        if label not in target.text_labels:
+            target.text_labels.append(label)
+    target.pages = sorted(set(target.pages) | set(source.pages))
+
+
+def _fuzzy_confidence(
+    first: Net, second: Net, aliases: dict[str, str] | None
+) -> float | None:
+    """Возвращает уверенность нечёткого слияния двух цепей или ``None``."""
+    if first.name is None or second.name is None or first.name == second.name:
+        return None
+    normalized_first = normalize_net_label(first.name)
+    normalized_second = normalize_net_label(second.name)
+    if normalized_first and normalized_first == normalized_second:
+        return CONFIDENCE_NORMALIZED
+    canonical_first = _canonical_net_label(first.name, aliases)
+    canonical_second = _canonical_net_label(second.name, aliases)
+    if canonical_first and canonical_first == canonical_second:
+        return CONFIDENCE_ALIAS
+    return None
+
+
+def merge_nets(
+    nets: list[Net],
+    aliases: dict[str, str] | None = None,
+    confidence_threshold: float | None = None,
+) -> tuple[list[Net], list[Issue]]:
+    """Объединяет цепи: точно, по нормализации и по синонимам (Т8, M2).
+
+    Правила:
+
+    1. Точное совпадение имени — слияние без ограничения по страницам
+       (прежняя семантика Т8), уверенность :data:`CONFIDENCE_EXACT`.
+    2. Совпадение нормализованных меток — :data:`CONFIDENCE_NORMALIZED`.
+    3. Совпадение по синониму ``symbols.yaml`` — :data:`CONFIDENCE_ALIAS`.
+    4. Нечёткие слияния (2, 3) выполняются ТОЛЬКО для цепей с разными
+       страницами: в пределах одной страницы одинаковые имена остаются
+       раздельными (регрессия H5).
+    5. Слияние применяется только при уверенности не ниже
+       ``net_merge_confidence`` из конфигурации (по умолчанию 0.7).
 
     Args:
         nets: Исходные цепи.
+        aliases: Синонимы «нормализованная метка → каноническая метка».
+        confidence_threshold: Порог слияния; по умолчанию из настроек.
 
     Returns:
-        Цепи, сгруппированные по имени; страницы и элементы объединены.
+        Кортеж ``(объединённые цепи, проблемы)``. Каждое нечёткое слияние
+        даёт ``Issue(type="nets_merged_fuzzy")`` с именами, страницами и
+        уверенностью.
     """
-    result: list[Net] = []
-    named: dict[str, Net] = {}
+    threshold = (
+        get_settings().net_merge_confidence
+        if confidence_threshold is None
+        else confidence_threshold
+    )
+    if aliases is None:
+        try:
+            from .components import load_net_aliases
+
+            aliases = load_net_aliases()
+        except Exception:  # noqa: BLE001 - синонимы не должны ломать netlist
+            aliases = {}
+
+    # Шаг 1: точное совпадение имён (как раньше).
+    groups: list[Net] = []
+    exact: dict[str, Net] = {}
     for net in nets:
         if net.name is None:
-            result.append(net)
+            groups.append(net)
             continue
-        existing = named.get(net.name)
+        existing = exact.get(net.name)
         if existing is None:
-            named[net.name] = net
-            result.append(net)
+            exact[net.name] = net
+            groups.append(net)
             continue
-        for node_id in net.nodes:
-            if node_id not in existing.nodes:
-                existing.nodes.append(node_id)
-        for connection in net.connections:
-            if connection not in existing.connections:
-                existing.connections.append(connection)
-        for pair in net.component_pins:
-            if pair not in existing.component_pins:
-                existing.component_pins.append(pair)
-        for label in net.text_labels:
-            if label not in existing.text_labels:
-                existing.text_labels.append(label)
-        existing.pages = sorted(set(existing.pages) | set(net.pages))
-    return result
+        _absorb_net(existing, net)
+
+    # Шаг 2: нечёткие cross-page слияния (union-find по индексам групп).
+    parent = list(range(len(groups)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    issues: list[Issue] = []
+    for first_index in range(len(groups)):
+        for second_index in range(first_index + 1, len(groups)):
+            first = groups[first_index]
+            second = groups[second_index]
+            confidence = _fuzzy_confidence(first, second, aliases)
+            if confidence is None or confidence < threshold:
+                continue
+            if set(first.pages) & set(second.pages):
+                continue  # одна и та же страница — не сливаем
+            parent[find(second_index)] = find(first_index)
+            issues.append(
+                Issue(
+                    type="nets_merged_fuzzy",
+                    page=min(first.pages + second.pages)
+                    if first.pages or second.pages
+                    else 0,
+                    description=(
+                        f"Цепи {first.name!r} (стр. {first.pages}) и "
+                        f"{second.name!r} (стр. {second.pages}) объединены: "
+                        f"normalize={normalize_net_label(first.name)!r}, "
+                        f"confidence={confidence:.2f}"
+                    ),
+                    confidence=confidence,
+                    required_action=default_action("nets_merged_fuzzy"),
+                )
+            )
+
+    merged: list[Net] = []
+    root_net: dict[int, Net] = {}
+    for index, net in enumerate(groups):
+        root = find(index)
+        target = root_net.get(root)
+        if target is None:
+            root_net[root] = net
+            merged.append(net)
+        elif target is not net:
+            _absorb_net(target, net)
+    return merged, issues
 
 
 def write_netlist_json(nets: list[Net], path: str) -> None:
@@ -206,4 +354,9 @@ def write_netlist_json(nets: list[Net], path: str) -> None:
         handle.write("\n")
 
 
-__all__ = ["build_netlist", "merge_nets", "write_netlist_json"]
+__all__ = [
+    "build_netlist",
+    "merge_nets",
+    "normalize_net_label",
+    "write_netlist_json",
+]

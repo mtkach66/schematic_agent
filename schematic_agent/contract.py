@@ -198,6 +198,70 @@ class PlcAnalysis(BaseModel):
     assumptions: list[str] = Field(default_factory=list)
 
 
+class SymbolGeometrySpec(BaseModel):
+    """Геометрические параметры декларативного шаблона УГО (M1).
+
+    Шаблон описывает прямоугольное УГО: соотношение сторон
+    ``long / short`` и диапазоны размеров короткой и длинной сторон, pt.
+    Сложные составные УГО намеренно не декларируются — только честные
+    геометрические эвристики.
+    """
+
+    kind: Literal["rect"] = "rect"
+    min_aspect: float = Field(default=1.0, gt=0.0)
+    max_aspect: float = Field(default=10.0, gt=0.0)
+    min_short: float = Field(default=2.0, ge=0.0)
+    max_short: float = Field(default=300.0, gt=0.0)
+    min_long: float = Field(default=2.0, ge=0.0)
+    max_long: float = Field(default=600.0, gt=0.0)
+
+
+class SymbolTemplateSpec(BaseModel):
+    """Декларативный шаблон УГО из ``symbols.yaml`` (M1).
+
+    Attributes:
+        name: Имя шаблона (``contactor``, ``breaker`` и т.п.).
+        category: Категория компонента, не зависящая от SPICE.
+        ref_prefixes: Префиксы позиционных обозначений (``KM``, ``QF``).
+            Кандидат принимается только при наличии рядом обозначения с
+            одним из этих префиксов — это защищает встроенные детекторы от
+            ложных перехватов прямоугольников.
+        geometry: Геометрические параметры :class:`SymbolGeometrySpec`.
+        confidence: Честная уверенность шаблона, 0–1.
+    """
+
+    name: str = Field(min_length=1)
+    category: str = Field(min_length=1)
+    ref_prefixes: list[str] = Field(default_factory=list)
+    geometry: SymbolGeometrySpec = Field(default_factory=SymbolGeometrySpec)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
+class BomOutput(BaseModel):
+    """Корневая схема ``bom.json`` (M3)."""
+
+    items: list[BomItem] = Field(default_factory=list)
+    source: Literal["table", "components_fallback"]
+
+
+class NetsOutput(BaseModel):
+    """Корневая схема ``netlist.json`` (M3)."""
+
+    nets: list[Net] = Field(default_factory=list)
+
+
+class ComponentsOutput(BaseModel):
+    """Корневая схема ``components.json`` (M3)."""
+
+    components: list[Component] = Field(default_factory=list)
+
+
+class IssuesOutput(BaseModel):
+    """Корневая схема ``issues.json`` (M3)."""
+
+    issues: list[Issue] = Field(default_factory=list)
+
+
 __all__ = [
     "WorkMode",
     "ResultStatus",
@@ -215,4 +279,10 @@ __all__ = [
     "Issue",
     "PlcLogicBlock",
     "PlcAnalysis",
+    "SymbolGeometrySpec",
+    "SymbolTemplateSpec",
+    "BomOutput",
+    "NetsOutput",
+    "ComponentsOutput",
+    "IssuesOutput",
 ]

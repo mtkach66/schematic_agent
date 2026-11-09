@@ -131,7 +131,11 @@ The public API also exposes `submit(task) -> str`, `get_result(task_id)`,
 
 ```bash
 schematic-agent parse /path/to/schema.pdf --mode full --output /tmp/out
+schematic-agent parse schema.pdf --gt examples/simple_ground_truth.json
+schematic-agent validate /tmp/out/schema
 ```
+
+Arguments of `parse`:
 
 | Argument | Purpose |
 |---|---|
@@ -141,9 +145,14 @@ schematic-agent parse /path/to/schema.pdf --mode full --output /tmp/out
 | `--output` | artifact directory (overrides `SCHEMATIC_AGENT_OUTPUT_DIR`) |
 | `--task-id` | task identifier (default `cli-task`) |
 | `--document-id` | document identifier (default: PDF name without extension) |
+| `--gt` | path to `ground_truth.json`; enables `metrics.json` and the metrics section |
 
-The CLI prints the `Result` as JSON and exits with code `0` unless the status
+`parse` prints the `Result` as JSON and exits with code `0` unless the status
 is `failed`, in which case it exits with `1`.
+
+`schematic-agent validate <dir>` validates `bom.json`, `netlist.json`,
+`components.json`, and `issues.json` against the pydantic schemas, prints a
+JSON report, and exits with `1` on any schema error or missing required file.
 
 ## Modes
 
@@ -173,10 +182,18 @@ produced:
 | `plc_analysis.json` | PLC logic data |
 | `report.md` | final report |
 | `vlm_calls.log` | VLM call log (JSON Lines, append) |
+| `metrics.json` | quality metrics, only with `--gt` (ninth file) |
 
-`Result.artifacts` contains absolute paths to all eight files. Except for a
-missing input file, artifacts are created even for `failed` results so callers
+`Result.artifacts` contains absolute paths to every created file (the `metrics`
+key appears only when ground truth is supplied). Except for a missing input
+file, the eight base artifacts are created even for `failed` results so callers
 can distinguish "no data" from an operational failure.
+
+`bom.json`, `netlist.json`, `components.json`, and `issues.json` are written
+through `artifacts.write_artifact`: serialization performs a round-trip check
+`model_dump → model_validate`, so the structure on disk is guaranteed to be
+readable by the root schemas `BomOutput`, `NetsOutput`, `ComponentsOutput`, and
+`IssuesOutput`.
 
 ## Configuration
 
@@ -187,6 +204,8 @@ can distinguish "no data" from an operational failure.
 | `SCHEMATIC_AGENT_STAGE_TIMEOUT_S` | per-stage guard timeout, seconds | `120` |
 | `SCHEMATIC_AGENT_MAX_CANDIDATES_PER_PAGE` | detector candidate cap per page | `10000` |
 | `SCHEMATIC_AGENT_MAX_SEGMENTS_PER_DETECTOR` | input segment cap per detector | `5000` |
+| `SCHEMATIC_AGENT_SYMBOLS_FILE` | external `symbols.yaml` (M1) | packaged file |
+| `SCHEMATIC_AGENT_NET_MERGE_CONFIDENCE` | fuzzy net-merge threshold (M2) | `0.7` |
 
 Invalid or non-positive values are ignored and replaced by defaults.
 
@@ -295,12 +314,84 @@ key (`bom.normalize_ref`: uppercase, keep only `[A-Z0-9]`), so `"c101 "` and
 `"C-101"` match. The stored `ref_designation` values are not modified, and
 nested designations (`C101` inside `C101HUD`) are not matched.
 
+## Configurable symbol library (M1)
+
+The packaged `schematic_agent/symbols.yaml` adds declarative templates to the
+six built-in detectors: `contactor` (KM), `breaker` (QF), `transformer` (T),
+`vfd` (UZ), and `terminal_block` (XT). A template describes a rectangular
+symbol: proportions (`min_aspect`/`max_aspect`) and side ranges
+(`min_short`/`max_short`/`min_long`/`max_long`) in pt, reference-designation
+prefixes, and an honest confidence of 0.4–0.6. A candidate is accepted only
+when a designation with one of the `ref_prefixes` is found nearby, so
+declarative templates do not steal rectangles from the built-in detectors.
+
+`SCHEMATIC_AGENT_SYMBOLS_FILE` loads an external YAML: templates with the same
+name replace packaged ones, new templates are added. A corrupt or missing file
+does not abort the pipeline: `Issue(type="symbols_config_error")` is recorded
+and the built-in detectors are used.
+
+When no external file is configured, the packaged `symbols.yaml` is always
+used; if it cannot be read, the built-in detector set remains the fallback.
+
+## Fuzzy cross-page net matching (M2)
+
+`netlist.merge_nets` merges nets in three modes:
+
+| Match | Confidence | Constraint |
+|---|---|---|
+| exact name | 1.0 | none (T8 behavior) |
+| normalized name (`L1`, `L1 `, `L-1`) | 0.9 | different pages only |
+| alias (`N`/`NUL`, `PE`/`PEN`) | 0.7 | different pages only |
+
+The threshold is `SCHEMATIC_AGENT_NET_MERGE_CONFIDENCE` (default 0.7). Within a
+single page, fuzzy names are intentionally not merged. Every fuzzy merge emits
+`Issue(type="nets_merged_fuzzy")` with both names, pages, and confidence.
+Aliases are defined in the `net_aliases` section of `symbols.yaml`; the
+packaged set is conservative (`NUL→N`, `PEN→PE`); `L1↔U`, `L2↔V`, and `L3↔W`
+mappings are disabled by default.
+
+## Artifact schema validation (M3)
+
+`schematic_agent/artifacts.py` provides `ARTIFACT_SCHEMAS` (root schemas
+`bom`, `netlist`, `components`, `issues`), `write_artifact(path, model)`, and
+`validate_artifacts(dir) -> dict`. The `validate <dir>` CLI subcommand prints
+the report `{"ok", "directory", "artifacts", "errors"}` and exits with `1` on
+error. JSON read errors and schema mismatches are included in the report.
+
+These root schemas are the contract for external LLM agents: any consumer can
+validate the artifacts before using them.
+
+## Quality metrics (M4)
+
+`schematic_agent/metrics.py` computes a `QualityReport` against a
+`ground_truth.json` reference:
+
+```json
+{
+  "components": [
+    {"ref_designation": "R1", "type": "resistor", "page": 1}
+  ],
+  "nets": [
+    {"name": "L1", "component_refs": ["R1", "R2"]}
+  ]
+}
+```
+
+Metrics: component precision/recall (via `bom.normalize_ref`), pin connectivity
+(share of reference "net → component" pairs found in the predicted net with
+the same name), net connectivity (mean Jaccard of `component_refs` sets), and
+BOM precision/recall. An empty denominator yields `null` (metric undefined).
+The result is written to `metrics.json` and to a `## Quality metrics` section
+of `report.md`; both appear only with `--gt`.
+
 ## Limitations
 
 - Raster pages are not OCR'd: `raster_only_page` is recorded with action
   `OCR required`, and page results are empty.
 - Built-in symbol templates are limited: resistor, capacitor, diode, terminal,
-  coil/winding, contact (`SYMBOL_TEMPLATES`). Other symbols near a reference
+  coil/winding, contact (`SYMBOL_TEMPLATES`). Declarative `symbols.yaml`
+  templates cover contactors, breakers, transformers, VFDs, and terminal
+  blocks with simple rectangular heuristics. Other symbols near a reference
   designation produce `Component(type="unknown")` and
   `Issue(type="unrecognized_symbol")`, which trigger the VLM.
 - Component type comes from the template; the designation prefix refines the
@@ -308,7 +399,8 @@ nested designations (`C101` inside `C101HUD`) are not matched.
 - Labels `L1`/`L2`/`L3` are treated as mains phases, not inductors: the `L`
   prefix is intentionally excluded from reference-designation parsing in
   geometry.
-- Cross-page labels merge nets only on exact label-name match.
+- Cross-page labels merge nets exactly, by normalization, and by alias;
+  fuzzy variants are restricted to different pages (M2).
 
 ## Examples
 
@@ -318,7 +410,14 @@ nested designations (`C101` inside `C101HUD`) are not matched.
 examples/simple.pdf     1 page: supply, F1, SB1, K1, HL1, L1/N, BOM (4 rows)
 examples/multipage.pdf  2 pages: cross-page label L1, components R1 and R2
 examples/problem.pdf    3 pages: raster page, crossing without junction, broken table
+
+examples/simple_ground_truth.json     M4 reference for simple.pdf
+examples/multipage_ground_truth.json  M4 reference for multipage.pdf
 ```
+
+The reference files are produced by the same generator (`generate_all`) and
+contain only the topology known to the generator; no reference is produced for
+`problem.pdf`.
 
 ## Testing
 

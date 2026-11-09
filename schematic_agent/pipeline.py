@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from .artifacts import write_artifact
 from .bom import (
     BOM_SOURCE_TABLE,
     build_bom_with_source,
@@ -26,9 +27,13 @@ from .components import detect_components
 from .config import get_settings
 from .contract import (
     BomItem,
+    BomOutput,
     Component,
+    ComponentsOutput,
     Issue,
+    IssuesOutput,
     Net,
+    NetsOutput,
     PlcAnalysis,
     Result,
     Summary,
@@ -37,7 +42,8 @@ from .contract import (
 )
 from .geometry import GeometryResult, build_geometry
 from .issues import collect_issues, default_action
-from .netlist import build_netlist, write_netlist_json
+from .metrics import evaluate, load_ground_truth, write_metrics
+from .netlist import build_netlist
 from .parser.pdf_extract import PdfExtraction, extract_pdf
 from .plc import analyze_plc
 from .report import build_report, write_report
@@ -116,23 +122,16 @@ def _write_artifacts(
     output_dir.mkdir(parents=True, exist_ok=True)
     paths = {key: str(output_dir / name) for key, name in ARTIFACT_FILES.items()}
 
-    _write_json(
-        Path(paths["bom"]),
-        {
-            "items": [item.model_dump() for item in bom_items],
-            "source": bom_source,
-        },
+    # Round-trip через корневые pydantic-схемы (M3): контракт проверяется
+    # до записи, поэтому на диск попадает только валидная структура.
+    write_artifact(
+        paths["bom"],
+        BomOutput(items=bom_items, source=bom_source),  # type: ignore[arg-type]
     )
     write_bom_csv(bom_items, paths["bom_csv"])
-    write_netlist_json(nets, paths["netlist"])
-    _write_json(
-        Path(paths["components"]),
-        {"components": [item.model_dump() for item in components]},
-    )
-    _write_json(
-        Path(paths["issues"]),
-        {"issues": [item.model_dump() for item in issues]},
-    )
+    write_artifact(paths["netlist"], NetsOutput(nets=nets))
+    write_artifact(paths["components"], ComponentsOutput(components=components))
+    write_artifact(paths["issues"], IssuesOutput(issues=issues))
     analysis = plc or PlcAnalysis()
     _write_json(Path(paths["plc_analysis"]), analysis.model_dump())
     # Журнал VLM — append-only: создаём файл, если его ещё нет, но никогда
@@ -157,7 +156,7 @@ def _options_for(options: TaskOptions) -> tuple[bool, bool, bool]:
     )
 
 
-def run(task: Task) -> Result:
+def run(task: Task, ground_truth_path: str | None = None) -> Result:
     """Выполняет задание и возвращает единый результат.
 
     Единый маппинг статусов (этап 10, ТЗ §11):
@@ -174,6 +173,9 @@ def run(task: Task) -> Result:
 
     Args:
         task: Валидное задание :class:`~schematic_agent.contract.Task`.
+        ground_truth_path: Необязательный путь к ``ground_truth.json`` (M4).
+            При задании дополнительно пишется ``metrics.json`` и раздел
+            «Метрики качества» в ``report.md``.
 
     Returns:
         Единый результат обработки.
@@ -296,6 +298,30 @@ def run(task: Task) -> Result:
             )
 
     issues = collect_issues(issues, stage_issues)
+
+    # M4: метрики качества считаются до записи артефактов, чтобы ошибка
+    # ground truth попала в issues.json, а не терялась.
+    quality_report = None
+    if ground_truth_path:
+        try:
+            truth = load_ground_truth(ground_truth_path)
+            quality_report = evaluate(components, nets, bom_items, truth)
+        except Exception as error:  # noqa: BLE001 - GT не должен ронять прогон
+            issues = collect_issues(
+                issues,
+                [
+                    Issue(
+                        type="metrics_error",
+                        description=(
+                            f"Не удалось вычислить метрики по "
+                            f"{ground_truth_path}: {error}"
+                        ),
+                        confidence=0.5,
+                        required_action=default_action("metrics_error"),
+                    )
+                ],
+            )
+
     status = _result_status(extraction, issues, parse_failed, empty_document)
     error: str | None = None
     if empty_document:
@@ -314,6 +340,10 @@ def run(task: Task) -> Result:
     artifacts = _write_artifacts(
         output_dir, components, issues, bom_items, nets, plc, bom_source
     )
+    if quality_report is not None:
+        artifacts["metrics"] = write_metrics(
+            quality_report, output_dir / "metrics.json"
+        )
     result = Result(
         task_id=task.task_id,
         status=status,
@@ -332,6 +362,7 @@ def run(task: Task) -> Result:
                 "plc": plc,
                 "issues": issues,
                 "vlm_log": artifacts.get("vlm_log"),
+                "metrics": quality_report,
             },
         ),
         artifacts["report"],

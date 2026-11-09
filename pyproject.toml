@@ -14,6 +14,7 @@ dependencies = [
   "pymupdf>=1.24",
   "pdfplumber>=0.11",
   "networkx>=3",
+  "pyyaml>=6",
 ]
 
 [project.optional-dependencies]
@@ -24,6 +25,9 @@ schematic-agent = "schematic_agent.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["schematic_agent*"]
+
+[tool.setuptools.package-data]
+schematic_agent = ["symbols.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

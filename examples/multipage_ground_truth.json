@@ -1,0 +1,23 @@
+{
+  "components": [
+    {
+      "ref_designation": "R1",
+      "type": "resistor",
+      "page": 1
+    },
+    {
+      "ref_designation": "R2",
+      "type": "resistor",
+      "page": 2
+    }
+  ],
+  "nets": [
+    {
+      "name": "L1",
+      "component_refs": [
+        "R1",
+        "R2"
+      ]
+    }
+  ]
+}

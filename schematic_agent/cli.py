@@ -1,8 +1,10 @@
 """CLI субагента.
 
-Пример::
+Примеры::
 
     schematic-agent parse schema.pdf --mode full --output /tmp/out
+    schematic-agent parse schema.pdf --gt examples/simple_ground_truth.json
+    schematic-agent validate /tmp/out/doc_001
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import os
 import sys
 from typing import Sequence
 
+from .artifacts import validate_artifacts
 from .config import OUTPUT_DIR_ENV
 from .contract import Task, TaskOptions, TaskPayload
 from .pipeline import MODES, run
@@ -53,7 +56,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Идентификатор документа (по умолчанию — имя PDF без расширения)",
     )
+    parse_cmd.add_argument(
+        "--gt",
+        default=None,
+        help="Путь к ground_truth.json для расчёта метрик качества (M4)",
+    )
+
+    validate_cmd = subparsers.add_parser(
+        "validate", help="Проверить JSON-артефакты каталога по схемам (M3)"
+    )
+    validate_cmd.add_argument(
+        "directory", help="Каталог артефактов <output>/<document_id>"
+    )
     return parser
+
+
+def _run_validate(directory: str) -> int:
+    """Выполняет подкоманду ``validate`` и печатает отчёт."""
+    report = validate_artifacts(directory)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if report.get("ok") else 1
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -67,6 +89,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     """
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "validate":
+        return _run_validate(args.directory)
 
     if args.output:
         os.environ[OUTPUT_DIR_ENV] = args.output
@@ -88,7 +113,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
 
-    result = run(task)
+    result = run(task, ground_truth_path=args.gt)
     print(json.dumps(result.model_dump(), ensure_ascii=False, indent=2))
     return 0 if result.status != "failed" else 1
 

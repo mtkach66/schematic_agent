@@ -25,6 +25,12 @@ MAX_CANDIDATES_ENV = "SCHEMATIC_AGENT_MAX_CANDIDATES_PER_PAGE"
 #: Переменная окружения для лимита сегментов на один детектор.
 MAX_SEGMENTS_ENV = "SCHEMATIC_AGENT_MAX_SEGMENTS_PER_DETECTOR"
 
+#: Переменная окружения с путём к внешнему ``symbols.yaml`` (M1).
+SYMBOLS_FILE_ENV = "SCHEMATIC_AGENT_SYMBOLS_FILE"
+
+#: Переменная окружения для порога слияния цепей по нечётким меткам (M2).
+NET_MERGE_CONFIDENCE_ENV = "SCHEMATIC_AGENT_NET_MERGE_CONFIDENCE"
+
 #: Общий таймаут документа по умолчанию (ТЗ §11, этап 10).
 DEFAULT_DOC_TIMEOUT_S = 600.0
 
@@ -36,6 +42,9 @@ DEFAULT_MAX_CANDIDATES_PER_PAGE = 10000
 
 #: Лимит сегментов на входе одного детектора.
 DEFAULT_MAX_SEGMENTS_PER_DETECTOR = 5000
+
+#: Порог уверенности слияния цепей по нечётким меткам (M2).
+DEFAULT_NET_MERGE_CONFIDENCE = 0.7
 
 #: Каталог артефактов по умолчанию (ТЗ §9).
 DEFAULT_OUTPUT_DIR = "/output"
@@ -91,6 +100,8 @@ class Settings:
     max_candidates_per_page: int = DEFAULT_MAX_CANDIDATES_PER_PAGE
     #: Максимум сегментов на входе одного детектора.
     max_segments_per_detector: int = DEFAULT_MAX_SEGMENTS_PER_DETECTOR
+    #: Минимальная уверенность нечёткого слияния цепей (M2).
+    net_merge_confidence: float = DEFAULT_NET_MERGE_CONFIDENCE
 
     @classmethod
     def load(cls, path: str | os.PathLike[str]) -> "Settings":
@@ -122,6 +133,20 @@ def _env_float(name: str, default: float) -> float:
     return value if value > 0 else default
 
 
+def _env_unit_float(name: str, default: float) -> float:
+    """Читает число из окружения, ограничивая его диапазоном ``[0, 1]``."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    if not 0.0 <= value <= 1.0:
+        return default
+    return value
+
+
 def _env_positive_int(name: str, default: int) -> int:
     """Читает положительное целое из окружения."""
     raw = os.environ.get(name)
@@ -145,7 +170,10 @@ def get_settings() -> Settings:
     * ``SCHEMATIC_AGENT_MAX_CANDIDATES_PER_PAGE`` —
       :attr:`Settings.max_candidates_per_page`;
     * ``SCHEMATIC_AGENT_MAX_SEGMENTS_PER_DETECTOR`` —
-      :attr:`Settings.max_segments_per_detector`.
+      :attr:`Settings.max_segments_per_detector`;
+    * ``SCHEMATIC_AGENT_NET_MERGE_CONFIDENCE`` —
+      :attr:`Settings.net_merge_confidence` (внешний ``symbols.yaml`` читается
+      через :data:`SYMBOLS_FILE_ENV`).
 
     Некорректные или неположительные значения игнорируются и заменяются
     значением по умолчанию.
@@ -161,6 +189,9 @@ def get_settings() -> Settings:
         max_segments_per_detector=_env_positive_int(
             MAX_SEGMENTS_ENV, DEFAULT_MAX_SEGMENTS_PER_DETECTOR
         ),
+        net_merge_confidence=_env_unit_float(
+            NET_MERGE_CONFIDENCE_ENV, DEFAULT_NET_MERGE_CONFIDENCE
+        ),
     )
 
 
@@ -170,11 +201,14 @@ __all__ = [
     "STAGE_TIMEOUT_ENV",
     "MAX_CANDIDATES_ENV",
     "MAX_SEGMENTS_ENV",
+    "SYMBOLS_FILE_ENV",
+    "NET_MERGE_CONFIDENCE_ENV",
     "DEFAULT_OUTPUT_DIR",
     "DEFAULT_DOC_TIMEOUT_S",
     "DEFAULT_STAGE_TIMEOUT_S",
     "DEFAULT_MAX_CANDIDATES_PER_PAGE",
     "DEFAULT_MAX_SEGMENTS_PER_DETECTOR",
+    "DEFAULT_NET_MERGE_CONFIDENCE",
     "Tolerances",
     "VlmSettings",
     "Settings",

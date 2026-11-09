@@ -10,12 +10,17 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
-from .config import Tolerances, get_settings
-from .contract import Component, Issue, Pin
+import yaml
+from pydantic import ValidationError
+
+from .config import SYMBOLS_FILE_ENV, Tolerances, get_settings
+from .contract import Component, Issue, Pin, SymbolTemplateSpec
 from .geometry import GeometryResult, Segment, build_geometry
 from .issues import default_action
 from .parser.pdf_extract import PageExtraction, PdfExtraction, TextSpan, VectorPrimitive
@@ -694,6 +699,233 @@ Detector = Callable[
     [list[VectorPrimitive], set[int], list[Issue] | None], list[Candidate]
 ]
 
+#: Детектор из ``symbols.yaml``: дополнительно получает тексты страницы для
+#: проверки префикса позиционного обозначения (ref-гейт).
+YamlDetector = Callable[
+    [list[VectorPrimitive], set[int], list[Issue] | None, list[TextSpan] | None],
+    list[Candidate],
+]
+
+
+@dataclass
+class SymbolConfig:
+    """Результат загрузки ``symbols.yaml``.
+
+    Attributes:
+        templates: Декларативные шаблоны (пакетные + внешние).
+        net_aliases: Отображение «нормализованный синоним → каноническая
+            нормализованная метка» для M2.
+        issues: Проблемы загрузки (``symbols_config_error``).
+    """
+
+    templates: list[SymbolTemplateSpec] = field(default_factory=list)
+    net_aliases: dict[str, str] = field(default_factory=dict)
+    issues: list[Issue] = field(default_factory=list)
+
+
+def default_symbols_path() -> Path:
+    """Путь к пакетному ``symbols.yaml`` (M1)."""
+    return Path(__file__).with_name("symbols.yaml")
+
+
+def _symbols_config_error(path: Path, error: str) -> Issue:
+    """Формирует Issue о непригодной конфигурации шаблонов."""
+    return Issue(
+        type="symbols_config_error",
+        description=(
+            f"Не удалось загрузить symbols.yaml ({path}): {error}. "
+            "Использованы встроенные детекторы"
+        ),
+        confidence=0.5,
+        required_action=default_action("symbols_config_error"),
+    )
+
+
+def _read_symbols_yaml(
+    path: Path, issues: list[Issue]
+) -> dict[str, Any] | None:
+    """Читает YAML-файл, фиксируя ошибку в ``issues`` вместо падения."""
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as error:
+        issues.append(_symbols_config_error(path, str(error)))
+        return None
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        issues.append(
+            _symbols_config_error(path, "корневой элемент должен быть словарём")
+        )
+        return None
+    return raw
+
+
+def _parse_aliases(
+    raw: Any, path: Path, issues: list[Issue]
+) -> dict[str, str]:
+    """Разбирает раздел ``net_aliases`` в отображение канонических меток."""
+    aliases: dict[str, str] = {}
+    if raw is None:
+        return aliases
+    if not isinstance(raw, list):
+        issues.append(
+            _symbols_config_error(path, "net_aliases должен быть списком")
+        )
+        return aliases
+    for group in raw:
+        if not isinstance(group, (list, tuple)) or len(group) < 2:
+            issues.append(
+                _symbols_config_error(
+                    path, f"группа net_aliases должна содержать 2+ метки: {group!r}"
+                )
+            )
+            continue
+        canonical = _normalize_alias_label(group[0])
+        if not canonical:
+            issues.append(
+                _symbols_config_error(path, f"пустая каноническая метка: {group!r}")
+            )
+            continue
+        for label in group[1:]:
+            normalized = _normalize_alias_label(label)
+            if normalized:
+                aliases[normalized] = canonical
+    return aliases
+
+
+def _normalize_alias_label(label: Any) -> str:
+    """Нормализует метку синонима так же, как :func:`netlist.normalize_net_label`."""
+    return re.sub(r"[^A-Z0-9]", "", str(label or "").upper())
+
+
+def load_symbols_config() -> SymbolConfig:
+    """Загружает декларативные шаблоны и синонимы цепей.
+
+    Порядок: пакетный ``symbols.yaml`` → внешний файл из
+    ``SCHEMATIC_AGENT_SYMBOLS_FILE`` (переопределяет шаблоны с тем же именем,
+    добавляет новые; раздел ``net_aliases`` внешнего файла дополняет и
+    переопределяет пакетный).
+
+    Битый или отсутствующий файл не прерывает конвейер: формируется
+    :class:`Issue` ``symbols_config_error``, конфигурация этого файла
+    пропускается, встроенные детекторы остаются рабочими.
+
+    Returns:
+        Загруженная конфигурация с проблемами.
+    """
+    config = SymbolConfig()
+    sources: list[Path] = [default_symbols_path()]
+    external = os.environ.get(SYMBOLS_FILE_ENV)
+    if external:
+        sources.append(Path(external))
+
+    templates: dict[str, SymbolTemplateSpec] = {}
+    for path in sources:
+        if not path.is_file():
+            config.issues.append(
+                _symbols_config_error(path, "файл не найден")
+            )
+            continue
+        raw = _read_symbols_yaml(path, config.issues)
+        if raw is None:
+            continue
+        entries = raw.get("symbols") or []
+        if not isinstance(entries, list):
+            config.issues.append(
+                _symbols_config_error(path, "symbols должен быть списком")
+            )
+            continue
+        for entry in entries:
+            try:
+                spec = SymbolTemplateSpec.model_validate(entry)
+            except ValidationError as error:
+                config.issues.append(
+                    _symbols_config_error(path, error.json())
+                )
+                continue
+            templates[spec.name] = spec
+        aliases = _parse_aliases(raw.get("net_aliases"), path, config.issues)
+        config.net_aliases.update(aliases)
+
+    config.templates = list(templates.values())
+    return config
+
+
+def load_net_aliases() -> dict[str, str]:
+    """Возвращает синонимы меток цепей без побочных проблем (M2)."""
+    try:
+        return dict(load_symbols_config().net_aliases)
+    except Exception:  # noqa: BLE001 - синонимы не должны ломать netlist
+        return {}
+
+
+def _has_ref_with_prefix(
+    bbox: tuple[float, float, float, float],
+    page: int,
+    texts: list[TextSpan] | None,
+    prefixes: set[str],
+    tolerance: float,
+) -> bool:
+    """Проверяет наличие обозначения с нужным префиксом рядом с bbox."""
+    if texts is None:
+        return False
+    for span in texts:
+        if span.page != page:
+            continue
+        match = _REF_RE.match(span.text)
+        if not match or match.group(1) not in prefixes:
+            continue
+        if _point_bbox_distance((span.cx, span.cy), bbox) <= tolerance:
+            return True
+    return False
+
+
+def _make_yaml_detector(spec: SymbolTemplateSpec) -> YamlDetector:
+    """Строит детектор прямоугольного УГО по декларативному шаблону."""
+
+    def detect(
+        primitives: list[VectorPrimitive],
+        used: set[int],
+        issues: list[Issue] | None = None,
+        texts: list[TextSpan] | None = None,
+    ) -> list[Candidate]:
+        del issues  # у декларативного детектора нет собственных проблем
+        geometry = spec.geometry
+        prefixes = {prefix.upper() for prefix in spec.ref_prefixes}
+        tolerance = get_settings().tolerances.ref_attach_pt
+        candidates: list[Candidate] = []
+        for index, primitive in enumerate(primitives):
+            if index in used or primitive.kind != geometry.kind:
+                continue
+            if prefixes and not _has_ref_with_prefix(
+                primitive.bbox, primitive.page, texts, prefixes, tolerance
+            ):
+                continue
+            x0, y0, x1, y1 = primitive.bbox
+            width, height = x1 - x0, y1 - y0
+            short, long = sorted((width, height))
+            if short <= 0 or long <= 0:
+                continue
+            aspect = long / short
+            if not (
+                geometry.min_aspect <= aspect <= geometry.max_aspect
+                and geometry.min_short <= short <= geometry.max_short
+                and geometry.min_long <= long <= geometry.max_long
+            ):
+                continue
+            candidates.append(
+                Candidate(
+                    spec.category,
+                    primitive.page,
+                    primitive.bbox,
+                    [index],
+                    spec.confidence,
+                )
+            )
+        return candidates
+
+    return detect
+
 #: Словарь шаблонов УГО: имя → функция-детектор.
 SYMBOL_TEMPLATES: dict[str, Detector] = {
     "resistor": _detect_resistors,
@@ -752,8 +984,14 @@ def _detect_candidates(
     primitives: list[VectorPrimitive],
     skip_indices: set[int] | None = None,
     issues: list[Issue] | None = None,
+    texts: list[TextSpan] | None = None,
+    config: SymbolConfig | None = None,
 ) -> list[Candidate]:
     """Прогоняет все шаблоны и убирает конфликты примитивов.
+
+    Порядок детекторов: сначала декларативные шаблоны ``symbols.yaml``
+    (у них есть ref-гейт по префиксу обозначения), затем встроенные.
+    Builtin-набор не изменяется и остаётся fallback-ом.
 
     Каждый детектор получает накопитель проблем: он сообщает об усечении
     входного списка сегментов (``detector_capped``). Дополнительно здесь
@@ -764,14 +1002,28 @@ def _detect_candidates(
         primitives: Примитивы страницы.
         skip_indices: Индексы, которые нельзя использовать (таблицы BOM).
         issues: Накопитель проблем этапа 4 (может быть ``None``).
+        texts: Тексты страницы для ref-гейта декларативных шаблонов.
+        config: Загруженная конфигурация символов; ``None`` — по умолчанию.
     """
     used: set[int] = set(skip_indices or ())
     result: list[Candidate] = []
     page = _page_of(primitives)
     issue_sink = issues if issues is not None else []
     candidate_limit = get_settings().max_candidates_per_page
-    for name, detector in SYMBOL_TEMPLATES.items():
-        detected = _dedupe_candidates(detector(primitives, used, issue_sink))
+    symbol_config = config or SymbolConfig()
+
+    detectors: list[tuple[str, Callable[..., list[Candidate]]]] = [
+        (spec.name, _make_yaml_detector(spec))
+        for spec in symbol_config.templates
+    ]
+    detectors.extend(SYMBOL_TEMPLATES.items())
+
+    for name, detector in detectors:
+        if name in SYMBOL_TEMPLATES:
+            raw = detector(primitives, used, issue_sink)
+        else:
+            raw = detector(primitives, used, issue_sink, texts)
+        detected = _dedupe_candidates(raw)
         if len(detected) > candidate_limit:
             issue_sink.append(
                 _detector_capped_issue(
@@ -923,13 +1175,16 @@ def detect_components(
     """
     tol = tolerances or get_settings().tolerances
     components: list[Component] = []
-    issues: list[Issue] = []
+    symbol_config = load_symbols_config()
+    issues: list[Issue] = list(symbol_config.issues)
     pin_number = 1
     net_label_keys = _net_label_keys(geometry)
 
     for page in extraction.pages:
         skip_indices = _table_primitive_indices(page)
-        candidates = _detect_candidates(page.primitives, skip_indices, issues)
+        candidates = _detect_candidates(
+            page.primitives, skip_indices, issues, page.texts, symbol_config
+        )
         excluded_keys = net_label_keys | _table_text_keys(page)
         assignments, unused_refs = _attach_ref_designations(
             candidates, page.texts, tol.ref_attach_pt,
@@ -1121,8 +1376,12 @@ def recognize_components(
 
 __all__ = [
     "SymbolTemplate",
+    "SymbolConfig",
     "Candidate",
     "SYMBOL_TEMPLATES",
+    "default_symbols_path",
+    "load_symbols_config",
+    "load_net_aliases",
     "load_templates",
     "detect_components",
     "recognize_components",

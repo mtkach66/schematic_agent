@@ -1,0 +1,44 @@
+{
+  "components": [
+    {
+      "ref_designation": "F1",
+      "type": "fuse",
+      "page": 1
+    },
+    {
+      "ref_designation": "SB1",
+      "type": "button",
+      "page": 1
+    },
+    {
+      "ref_designation": "K1",
+      "type": "relay",
+      "page": 1
+    },
+    {
+      "ref_designation": "HL1",
+      "type": "lamp",
+      "page": 1
+    }
+  ],
+  "nets": [
+    {
+      "name": "L1",
+      "component_refs": [
+        "F1",
+        "SB1",
+        "K1",
+        "HL1"
+      ]
+    },
+    {
+      "name": "N",
+      "component_refs": [
+        "F1",
+        "SB1",
+        "K1",
+        "HL1"
+      ]
+    }
+  ]
+}

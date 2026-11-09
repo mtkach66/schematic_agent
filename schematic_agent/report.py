@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .contract import Result
+from .metrics import QualityReport, metrics_section
 
 
 def _component_line(item: Any) -> str:
@@ -223,6 +224,9 @@ def build_report(
     issues = list(details.get("issues") or [])
     plc = details.get("plc")
     vlm_log = details.get("vlm_log")
+    metrics = details.get("metrics")
+    if isinstance(metrics, dict):
+        metrics = QualityReport.model_validate(metrics)
 
     lines: list[str] = [
         "# Отчёт анализа принципиальной схемы",
@@ -339,6 +343,10 @@ def build_report(
             lines.append("")
             lines.append("Предположения:")
             lines.extend(f"- {assumption}" for assumption in plc.assumptions)
+
+    # M4: раздел метрик выводится только при заданном ground truth.
+    if isinstance(metrics, QualityReport):
+        lines.extend(["", *metrics_section(metrics)])
 
     lines.extend(
         [
