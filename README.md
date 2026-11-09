@@ -268,7 +268,7 @@ and sets `source="components_fallback"` in `bom.json`. Components are
 aggregated by `(ref_designation, type)`: `quantity` is the match count,
 `name`/`category` come from the component type, `page` is the page of the
 first component, and `confidence` is `min(confidence) * 0.9`. Components of
-type `unknown` are named `[НЕТ В ПЕРЕЧНЕ]`. Components without a
+type `unknown` are named `[NOT IN BOM]`. Components without a
 `ref_designation` are skipped. All fallback rows have
 `found_on_schematic=True`; `component_not_in_bom` and
 `bom_item_not_on_schematic` are not raised for the fallback. The

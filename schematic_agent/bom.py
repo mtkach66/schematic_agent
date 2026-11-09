@@ -39,7 +39,7 @@ BOM_SOURCE_TABLE = "table"
 BOM_SOURCE_FALLBACK = "components_fallback"
 
 #: Наименование строки BOM-фолбэка при неопознанном типе компонента.
-FALLBACK_PLACEHOLDER = "[НЕТ В ПЕРЕЧНЕ]"
+FALLBACK_PLACEHOLDER = "[NOT IN BOM]"
 
 #: Колонки BOM в порядке CSV (ТЗ §10).
 BOM_CSV_FIELDS: tuple[str, ...] = (
