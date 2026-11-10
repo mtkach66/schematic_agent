@@ -204,7 +204,7 @@ readable by the root schemas `BomOutput`, `NetsOutput`, `ComponentsOutput`, and
 | `SCHEMATIC_AGENT_STAGE_TIMEOUT_S` | per-stage guard timeout, seconds | `120` |
 | `SCHEMATIC_AGENT_MAX_CANDIDATES_PER_PAGE` | detector candidate cap per page | `10000` |
 | `SCHEMATIC_AGENT_MAX_SEGMENTS_PER_DETECTOR` | input segment cap per detector | `5000` |
-| `SCHEMATIC_AGENT_SYMBOLS_FILE` | external `symbols.yaml` (M1) | packaged file |
+| `SCHEMATIC_AGENT_SYMBOLS_FILE` | external `symbols.yaml` (M1) or `symbols_library.yaml` (rich) | packaged file |
 | `SCHEMATIC_AGENT_NET_MERGE_CONFIDENCE` | fuzzy net-merge threshold (M2) | `0.7` |
 
 Invalid or non-positive values are ignored and replaced by defaults.
@@ -314,7 +314,7 @@ key (`bom.normalize_ref`: uppercase, keep only `[A-Z0-9]`), so `"c101 "` and
 `"C-101"` match. The stored `ref_designation` values are not modified, and
 nested designations (`C101` inside `C101HUD`) are not matched.
 
-## Configurable symbol library (M1)
+## Configurable symbol library (M1/M5)
 
 The packaged `schematic_agent/symbols.yaml` adds declarative templates to the
 six built-in detectors: `contactor` (KM), `breaker` (QF), `transformer` (T),
@@ -332,6 +332,52 @@ and the built-in detectors are used.
 
 When no external file is configured, the packaged `symbols.yaml` is always
 used; if it cannot be read, the built-in detector set remains the fallback.
+
+### Rich symbol library (M5)
+
+The packaged `schematic_agent/symbols_library.yaml` (about 4.2 MB) is a rich
+library exported from EPlan/Owen Logic. Each record describes one symbol
+variant:
+
+```yaml
+symbols:
+  - name: S
+    variant: '0'
+    heuristic: switch
+    bounding_box: {width: 4.0, height: 8.0}
+    connection_points:
+      - {designation: '', index: 0, direction: Up, x: 0.0, y: 4.0,
+         x_rel: 0.0, y_rel: 0.5}
+```
+
+Fields:
+
+| Field | Meaning |
+|---|---|
+| `name` | Symbol name; matches the reference-designation prefix (`S1` → `S`) |
+| `variant` | Variant identifier (rotations/versions of the same symbol) |
+| `heuristic` | Heuristic category (`switch`, `coil`, …); `unknown` when unclassified |
+| `bounding_box` | Symbol dimensions (`width`, `height`) in library units |
+| `connection_points` | Connection points with `designation`, `index`, `direction`, `x`, `y`, `x_rel`, `y_rel` |
+
+The file format is auto-detected by the keys of its records: `variant` and
+`heuristic` indicate the rich library, `category` and `geometry` indicate an
+M1 template file. The same `SCHEMATIC_AGENT_SYMBOLS_FILE` variable selects the
+source: a rich file, an M1 template file, or the packaged file when the
+variable is unset. M1 template loading skips rich records; the rich loader
+skips M1 records and returns an empty library for them. A corrupt rich file
+does not abort the pipeline: `Issue(type="symbols_config_error")` is recorded
+and the built-in detectors continue to work.
+
+Detected components with a reference designation are enriched in place with
+the matching rich symbol: `symbol_name`, `symbol_variant`,
+`expected_pin_count`, `heuristic`, and `symbol_categories` are added to
+`attributes`. The variant is selected by the closest bounding-box aspect
+ratio. Enrichment never changes the component type or confidence assigned by
+the built-in detectors. If the expected pin count differs from the actual pin
+count, an `Issue(type="pin_count_mismatch")` is emitted with confidence `0.5`
+and required action `VLM review`; records with `heuristic: unknown` only
+enrich attributes and are not checked for pin-count mismatches.
 
 ## Fuzzy cross-page net matching (M2)
 

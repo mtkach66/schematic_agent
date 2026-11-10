@@ -237,6 +237,51 @@ class SymbolTemplateSpec(BaseModel):
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
+class SymbolConnectionPoint(BaseModel):
+    """Точка подключения rich-УГО из ``symbols_library.yaml``.
+
+    Координаты заданы в единицах библиотеки УГО (не pt листа схемы),
+    поэтому к геометрии листа они не применяются напрямую.
+    """
+
+    designation: str = ""
+    index: int = 0
+    direction: str = ""
+    x: float = 0.0
+    y: float = 0.0
+    x_rel: float = 0.0
+    y_rel: float = 0.0
+
+
+class SymbolBoundingBox(BaseModel):
+    """Габариты rich-УГО в единицах библиотеки."""
+
+    width: float = Field(default=0.0, ge=0.0)
+    height: float = Field(default=0.0, ge=0.0)
+
+
+class SymbolLibraryEntry(BaseModel):
+    """Запись rich-библиотеки УГО (одно имя + вариант).
+
+    Формат: ``{name, variant, heuristic, bounding_box, connection_points}``.
+    Одно имя может иметь несколько вариантов (поворотов/исполнений).
+    """
+
+    name: str = Field(min_length=1)
+    variant: str = ""
+    heuristic: str = "unknown"
+    bounding_box: SymbolBoundingBox = Field(default_factory=SymbolBoundingBox)
+    connection_points: list[SymbolConnectionPoint] = Field(default_factory=list)
+
+    @field_validator("variant", mode="before")
+    @classmethod
+    def _variant_to_str(cls, value: Any) -> str:
+        """Приводит вариант к строке (в YAML встречаются числа)."""
+        if value is None:
+            return ""
+        return str(value)
+
+
 class BomOutput(BaseModel):
     """Корневая схема ``bom.json`` (M3)."""
 
@@ -281,6 +326,9 @@ __all__ = [
     "PlcAnalysis",
     "SymbolGeometrySpec",
     "SymbolTemplateSpec",
+    "SymbolConnectionPoint",
+    "SymbolBoundingBox",
+    "SymbolLibraryEntry",
     "BomOutput",
     "NetsOutput",
     "ComponentsOutput",

@@ -27,7 +27,7 @@ schematic-agent = "schematic_agent.cli:main"
 include = ["schematic_agent*"]
 
 [tool.setuptools.package-data]
-schematic_agent = ["symbols.yaml"]
+schematic_agent = ["symbols.yaml", "symbols_library.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

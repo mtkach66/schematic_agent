@@ -29,6 +29,11 @@ from .spatial import (
     iter_bbox_near_index_pairs,
     neighbors_in_tolerance,
 )
+from .symbols_library import (
+    LibrarySpec,
+    detect_symbols_format,
+    load_symbols_library,
+)
 
 #: Позиционное обозначение: R1, VD12, KM3, XT1 (1–3 буквы + 1–4 цифры).
 _REF_RE = re.compile(r"^([A-ZА-Я]{1,3})([0-9]{1,4})$")
@@ -820,11 +825,17 @@ def load_symbols_config() -> SymbolConfig:
         sources.append(Path(external))
 
     templates: dict[str, SymbolTemplateSpec] = {}
+    default_path = default_symbols_path()
     for path in sources:
         if not path.is_file():
             config.issues.append(
                 _symbols_config_error(path, "файл не найден")
             )
+            continue
+        # Rich-библиотека УГО — источник symbols_library.load_symbols_library.
+        # Не разбираем 4.2 МБ rich-YAML как M1-шаблоны: это дорого и
+        # порождает тысячи ложных ValidationError.
+        if path != default_path and detect_symbols_format(path) == "rich":
             continue
         raw = _read_symbols_yaml(path, config.issues)
         if raw is None:
@@ -836,6 +847,11 @@ def load_symbols_config() -> SymbolConfig:
             )
             continue
         for entry in entries:
+            if isinstance(entry, dict) and (
+                "variant" in entry or "heuristic" in entry
+            ):
+                # Rich-запись относится к symbols_library, не к M1-шаблонам.
+                continue
             try:
                 spec = SymbolTemplateSpec.model_validate(entry)
             except ValidationError as error:
@@ -1158,6 +1174,88 @@ def _pins_for_component(
     return pins, number
 
 
+def enrich_components_with_symbol_library(
+    components: list[Component],
+    library: LibrarySpec,
+) -> list[Issue]:
+    """Обогащает распознанные компоненты данными rich-библиотеки УГО.
+
+    Обогащение не меняет тип/уверенность, найденные builtin-детекторами:
+    rich-данные только дополняют ``attributes`` и служат источником
+    сверки числа выводов.
+
+    Для компонента с позиционным обозначением берётся префикс (``S1`` →
+    ``S``) и ищется УГО с тем же именем. Вариант выбирается по близости
+    аспекта bbox. В ``attributes`` добавляются ``symbol_name``,
+    ``symbol_variant``, ``expected_pin_count``, ``heuristic`` и
+    ``symbol_categories``. Bbox-фильтр не применяется: единицы библиотеки
+    не совпадают с pt листа.
+
+    Если rich-библиотека задала ожидаемое число выводов и оно не совпало с
+    фактическим, формируется :class:`Issue` ``pin_count_mismatch`` —
+    кандидат на VLM-проверку (confidence 0.5). Записи с
+    ``heuristic=unknown`` только обогащают attributes: их ожидание не
+    считается подтверждённой категорией.
+
+    Args:
+        components: Распознанные компоненты (изменяются на месте).
+        library: Загруженная rich-библиотека.
+
+    Returns:
+        Список проблем ``pin_count_mismatch``.
+    """
+    issues: list[Issue] = []
+    for component in components:
+        ref_designation = component.ref_designation or ""
+        match = _REF_RE.match(ref_designation)
+        if not match:
+            continue
+        spec = library.get(match.group(1))
+        if spec is None:
+            continue
+        width = height = 0.0
+        bbox = component.attributes.get("bbox")
+        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+            width = abs(float(bbox[2]) - float(bbox[0]))
+            height = abs(float(bbox[3]) - float(bbox[1]))
+        variant = spec.match_variant(width, height)
+        if variant is None:
+            continue
+        component.attributes["symbol_name"] = spec.name
+        component.attributes["symbol_variant"] = variant.variant
+        component.attributes["expected_pin_count"] = variant.expected_pin_count
+        component.attributes["heuristic"] = variant.heuristic
+        component.attributes["symbol_categories"] = sorted(spec.categories)
+
+        actual = len(component.pins)
+        # heuristic=unknown — категория УГО не подтверждена библиотекой:
+        # ожидаемое число выводов не сверяем (иначе builtin-детекторы
+        # получают ложные расхождения на синтетике), но attributes
+        # заполняем для диагностики.
+        if variant.heuristic == "unknown":
+            continue
+        if actual == variant.expected_pin_count:
+            continue
+        page = component.attributes.get("page", 0)
+        page_number = int(page) if isinstance(page, (int, float)) else 0
+        issues.append(
+            Issue(
+                type="pin_count_mismatch",
+                page=page_number,
+                x=component.x,
+                y=component.y,
+                description=(
+                    f"Число выводов {ref_designation} не совпадает с УГО "
+                    f"{spec.name} (вариант {variant.variant}): ожидалось "
+                    f"{variant.expected_pin_count}, фактически {actual}"
+                ),
+                confidence=0.5,
+                required_action="VLM review",
+            )
+        )
+    return issues
+
+
 def detect_components(
     geometry: GeometryResult,
     extraction: PdfExtraction,
@@ -1176,7 +1274,11 @@ def detect_components(
     tol = tolerances or get_settings().tolerances
     components: list[Component] = []
     symbol_config = load_symbols_config()
-    issues: list[Issue] = list(symbol_config.issues)
+    symbol_library = load_symbols_library()
+    issues: list[Issue] = [
+        *symbol_config.issues,
+        *symbol_library.issues,
+    ]
     pin_number = 1
     net_label_keys = _net_label_keys(geometry)
 
@@ -1283,6 +1385,7 @@ def detect_components(
                 )
             )
 
+    issues.extend(enrich_components_with_symbol_library(components, symbol_library))
     return components, issues
 
 
@@ -1381,6 +1484,7 @@ __all__ = [
     "SYMBOL_TEMPLATES",
     "default_symbols_path",
     "load_symbols_config",
+    "enrich_components_with_symbol_library",
     "load_net_aliases",
     "load_templates",
     "detect_components",
