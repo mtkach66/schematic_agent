@@ -18,6 +18,17 @@
   направления точек подключения и эвристическая категория;
 * :class:`SymbolSpec` — имя: набор категорий и словарь вариантов.
 
+Секция верхнего уровня ``ref_prefix_map`` (M6) сопоставляет префикс
+позиционного обозначения проекта (ГОСТ: ``QF``, ``KM``, ``XT``…) с
+категорией ``heuristic`` или со списком имён УГО::
+
+    ref_prefix_map:
+      QF: breaker
+      KM: [SCHB, SCHL]
+
+Значение-строка — категория (ищутся все записи с этим ``heuristic``),
+значение-список — точные имена УГО (приоритет выше категории).
+
 Формат определяется по ключам записей: ``variant``/``heuristic`` — rich,
 ``category``/``geometry`` — M1-шаблон (см. ``components.SymbolConfig``).
 M1-записи этим загрузчиком игнорируются: их обрабатывает
@@ -57,6 +68,10 @@ from .issues import default_action
 
 #: Тип результата определения формата файла.
 SymbolsFileFormat = Literal["rich", "template", "unknown"]
+
+#: Значение ``ref_prefix_map``: категория heuristic (строка) или точные
+#: имена УГО (кортеж имён).
+RefPrefixTarget = str | tuple[str, ...]
 
 #: Обязательные ключи rich-записи.
 _RICH_REQUIRED_KEYS = frozenset(
@@ -180,12 +195,18 @@ class LibrarySpec:
 
     Attributes:
         symbols: Отображение «имя → :class:`SymbolSpec`».
+        ref_prefix_map: Таблица «ref-префикс → категория или имена УГО»
+            (M6); пустая, если секции в файле нет.
+        category_index: Индекс «категория heuristic → имена УГО» (M6):
+            позволяет не сканировать всю библиотеку на каждый компонент.
         issues: Проблемы загрузки (``symbols_config_error``).
         source: Путь источника (пустая строка, если файла не было).
         exists: Признак существования файла-источника.
     """
 
     symbols: dict[str, SymbolSpec] = field(default_factory=dict)
+    ref_prefix_map: dict[str, RefPrefixTarget] = field(default_factory=dict)
+    category_index: dict[str, tuple[str, ...]] = field(default_factory=dict)
     issues: list[Issue] = field(default_factory=list)
     source: str = ""
     exists: bool = False
@@ -198,6 +219,59 @@ class LibrarySpec:
     def get(self, name: str) -> SymbolSpec | None:
         """Возвращает УГО по имени или ``None``."""
         return self.symbols.get(name)
+
+
+def parse_ref_prefix_map(raw: Any) -> dict[str, RefPrefixTarget]:
+    """Разбирает и валидирует секцию ``ref_prefix_map`` (M6).
+
+    Формат: словарь «префикс позиционного обозначения → категория
+    ``heuristic`` (строка) | список точных имён УГО». Префиксы
+    нормализуются в верхний регистр, категории — в нижний (так они записаны
+    в библиотеке). Пустые элементы списка отбрасываются.
+
+    Args:
+        raw: Значение секции из YAML (``None``, если секции нет).
+
+    Returns:
+        Нормализованная таблица (пустая, если секции нет).
+
+    Raises:
+        ValueError: Секция или отдельная запись имеют неверный формат.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("ref_prefix_map должен быть словарём")
+    result: dict[str, RefPrefixTarget] = {}
+    for key, value in raw.items():
+        prefix = str(key).strip().upper()
+        if not prefix or not prefix.isalnum():
+            raise ValueError(
+                f"некорректный ref-префикс в ref_prefix_map: {key!r}"
+            )
+        if isinstance(value, str):
+            category = value.strip().lower()
+            if not category:
+                raise ValueError(
+                    f"пустая категория в ref_prefix_map для {prefix!r}"
+                )
+            result[prefix] = category
+            continue
+        if isinstance(value, (list, tuple)):
+            names = tuple(
+                str(item).strip() for item in value if str(item).strip()
+            )
+            if not names:
+                raise ValueError(
+                    f"пустой список имён в ref_prefix_map для {prefix!r}"
+                )
+            result[prefix] = names
+            continue
+        raise ValueError(
+            f"значение ref_prefix_map для {prefix!r} должно быть строкой "
+            f"или списком имён: {value!r}"
+        )
+    return result
 
 
 def default_symbols_library_path() -> Path:
@@ -259,20 +333,66 @@ def _parse_rich_yaml(text: str) -> dict[str, Any]:
     """
     lines = text.splitlines()
     symbols: list[dict[str, Any]] = []
+    prefix_map: dict[str, Any] = {}
     current: dict[str, Any] | None = None
     section: str | None = None
     item: dict[str, Any] | None = None
+    last_prefix: str | None = None
     started = False
 
     for raw_line in lines:
         if not raw_line.strip() or raw_line.lstrip().startswith("#"):
             continue
-        if not started:
-            if raw_line.strip() == "symbols:":
-                started = True
-                continue
-            raise _FastParseError("ожидалась корневая секция symbols:")
         stripped = raw_line.strip()
+        if stripped == "symbols:":
+            started = True
+            section = None
+            current = None
+            item = None
+            continue
+        if stripped == "ref_prefix_map:":
+            section = "prefix_map"
+            current = None
+            item = None
+            last_prefix = None
+            continue
+        if not raw_line[:1].isspace() and ":" in stripped:
+            key_name = stripped.split(":", 1)[0].strip()
+            if key_name.isidentifier() and not stripped.startswith("- "):
+                # Неизвестная корневая секция — переходим на общий парсер.
+                raise _FastParseError(
+                    f"неожиданная корневая секция: {stripped!r}"
+                )
+        if section == "prefix_map":
+            if stripped.startswith("- "):
+                if last_prefix is None:
+                    raise _FastParseError(
+                        "элемент списка без ключа в ref_prefix_map"
+                    )
+                prefix_map[last_prefix].append(_scalar(stripped[2:]))
+                continue
+            if ":" not in stripped:
+                raise _FastParseError(
+                    f"строка без ':' в ref_prefix_map — {stripped!r}"
+                )
+            key, value = stripped.split(":", 1)
+            last_prefix = _scalar(key)
+            inline = value.strip()
+            if not inline:
+                prefix_map[last_prefix] = []
+            elif inline.startswith("[") and inline.endswith("]"):
+                prefix_map[last_prefix] = [
+                    _scalar(part)
+                    for part in inline[1:-1].split(",")
+                    if part.strip()
+                ]
+                last_prefix = None
+            else:
+                prefix_map[last_prefix] = _scalar(inline)
+                last_prefix = None
+            continue
+        if not started:
+            raise _FastParseError("ожидалась корневая секция symbols:")
         if stripped.startswith("- name:"):
             current = {
                 "name": _scalar(stripped[len("- name:"):]),
@@ -324,7 +444,7 @@ def _parse_rich_yaml(text: str) -> dict[str, Any]:
         for point in entry["connection_points"]:
             if not _CP_REQUIRED_KEYS <= set(point):
                 raise _FastParseError("неполная connection_points")
-    return {"symbols": symbols}
+    return {"symbols": symbols, "ref_prefix_map": prefix_map}
 
 
 def _detect_text_format(text: str) -> SymbolsFileFormat:
@@ -337,14 +457,34 @@ def _detect_text_format(text: str) -> SymbolsFileFormat:
         ``"rich"``, ``"template"`` или ``"unknown"``.
     """
     in_symbols = False
+    in_prefix_map = False
     for raw_line in text.splitlines():
         stripped = raw_line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        if not in_symbols:
+        is_root_key = (
+            not raw_line[:1].isspace()
+            and ":" in stripped
+            and not stripped.startswith("- ")
+        )
+        if is_root_key:
+            # Корневая секция: ref_prefix_map может идти до symbols.
             if stripped == "symbols:":
                 in_symbols = True
+                in_prefix_map = False
                 continue
+            if stripped == "ref_prefix_map:":
+                in_prefix_map = True
+                continue
+            if in_symbols:
+                # Секция после symbols (например, net_aliases) — записей
+                # дальше нет, формат уже определён (или не определится).
+                break
+            return "unknown"
+        if in_prefix_map:
+            # Записи таблицы префиксов не участвуют в определении формата.
+            continue
+        if not in_symbols:
             return "unknown"
         key = stripped
         if key.startswith("- "):
@@ -399,15 +539,32 @@ def _parse_yaml_text(path: Path, text: str) -> dict[str, Any] | None:
     return raw
 
 
+def _build_ref_prefix_map(
+    raw: dict[str, Any], path: Path, issues: list[Issue]
+) -> dict[str, RefPrefixTarget]:
+    """Разбирает ``ref_prefix_map``, фиксируя битый формат в ``issues``."""
+    try:
+        return parse_ref_prefix_map(raw.get("ref_prefix_map"))
+    except ValueError as error:
+        issues.append(_config_error(path, str(error)))
+        return {}
+
+
 def _build_library(
     raw: dict[str, Any], path: Path
-) -> tuple[dict[str, SymbolSpec], list[Issue]]:
+) -> tuple[
+    dict[str, SymbolSpec],
+    dict[str, RefPrefixTarget],
+    dict[str, tuple[str, ...]],
+    list[Issue],
+]:
     """Собирает агрегированную библиотеку из разобранного YAML."""
     issues: list[Issue] = []
+    ref_prefix_map = _build_ref_prefix_map(raw, path, issues)
     entries = raw.get("symbols") or []
     if not isinstance(entries, list):
         issues.append(_config_error(path, "symbols должен быть списком"))
-        return {}, issues
+        return {}, ref_prefix_map, {}, issues
 
     categories: dict[str, set[str]] = {}
     variants: dict[str, dict[str, SymbolVariantSpec]] = {}
@@ -443,7 +600,14 @@ def _build_library(
         )
         for name in variants
     }
-    return symbols, issues
+    index: dict[str, list[str]] = {}
+    for name in sorted(symbols):
+        for category in symbols[name].categories:
+            index.setdefault(category, []).append(name)
+    category_index = {
+        category: tuple(names) for category, names in index.items()
+    }
+    return symbols, ref_prefix_map, category_index, issues
 
 
 def _entry_format(entry: dict[str, Any]) -> SymbolsFileFormat:
@@ -479,9 +643,11 @@ def _load_cached(
     if _detect_text_format(text) != "rich":
         # Формат M1 (или пустой/неизвестный): rich-записей нет.
         return LibrarySpec(source=path_text, exists=True)
-    symbols, issues = _build_library(raw, path)
+    symbols, ref_prefix_map, category_index, issues = _build_library(raw, path)
     return LibrarySpec(
         symbols=symbols,
+        ref_prefix_map=ref_prefix_map,
+        category_index=category_index,
         issues=issues,
         source=path_text,
         exists=True,
@@ -526,10 +692,12 @@ def load_symbols_library(
 
 __all__ = [
     "SymbolsFileFormat",
+    "RefPrefixTarget",
     "SymbolVariantSpec",
     "SymbolSpec",
     "LibrarySpec",
     "default_symbols_library_path",
     "detect_symbols_format",
     "load_symbols_library",
+    "parse_ref_prefix_map",
 ]

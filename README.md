@@ -314,7 +314,7 @@ key (`bom.normalize_ref`: uppercase, keep only `[A-Z0-9]`), so `"c101 "` and
 `"C-101"` match. The stored `ref_designation` values are not modified, and
 nested designations (`C101` inside `C101HUD`) are not matched.
 
-## Configurable symbol library (M1/M5)
+## Configurable symbol library (M1/M5/M6)
 
 The packaged `schematic_agent/symbols.yaml` adds declarative templates to the
 six built-in detectors: `contactor` (KM), `breaker` (QF), `transformer` (T),
@@ -378,6 +378,36 @@ the built-in detectors. If the expected pin count differs from the actual pin
 count, an `Issue(type="pin_count_mismatch")` is emitted with confidence `0.5`
 and required action `VLM review`; records with `heuristic: unknown` only
 enrich attributes and are not checked for pin-count mismatches.
+
+### Reference-prefix mapping (M6)
+
+Rich-library names (`SL`, `S`, `SSV`, …) rarely coincide with the
+reference-designation prefixes used by industrial projects (GOST: `QF`, `KM`,
+`XT`, …), so exact matches are rare. The top-level `ref_prefix_map` section of
+`symbols.yaml` adds a second matching step. The matching cascade is:
+
+1. exact match: the designation prefix equals a rich-library symbol name
+   (`S1` → `S`);
+2. otherwise `ref_prefix_map[prefix]`: a name list (intersection with the
+   library, highest priority) or a `heuristic` category (all symbols with that
+   category);
+3. the variant is selected by the closest bounding-box aspect ratio, so a 90°
+   rotation does not matter.
+
+```yaml
+ref_prefix_map:
+  QF: breaker          # category: every symbol with heuristic == breaker
+  KM: [SCHB, SCHL]     # name list takes priority over a category
+```
+
+Packaged table: `QF→breaker`, `F/FA/FU→fuse`, `M→motor`, `H/HL→lamp`,
+`X/XT→terminal`, `K/KA/KM/KT/KB→switch`, `S/SB/SA/SQ→switch`. Both loaders
+read the table: `load_symbols_config` (M1 templates) and `load_symbols_library`
+(rich library); when both define it, the rich file wins for the same prefix.
+`SCHEMATIC_AGENT_SYMBOLS_FILE` extends and overrides the packaged table per
+key. Enriched components get `symbol_match` in `attributes`: `exact`, `names`,
+or `category`. A malformed `ref_prefix_map` produces
+`Issue(type="symbols_config_error")` and an empty table.
 
 ## Fuzzy cross-page net matching (M2)
 

@@ -279,3 +279,195 @@ def test_enrichment_keeps_builtin_detection() -> None:
     assert component.confidence == pytest.approx(0.42)
     assert component.attributes["symbol_name"] == "S"
     assert component.attributes["symbol_variant"] in {"0", "1", "2", "3"}
+
+
+# --- M6: маппинг «ref-префикс → УГО EPLAN» ------------------------------
+
+
+def _rich_record(
+    name: str,
+    variant: str,
+    heuristic: str,
+    width: float,
+    height: float,
+    pins: int = 2,
+) -> str:
+    """Фрагмент rich-библиотеки: одно имя + один вариант."""
+    points = "\n".join(
+        f"""  - designation: ''
+    index: {index}
+    direction: {'Up' if index % 2 == 0 else 'Down'}
+    x: 0.0
+    y: 0.0
+    x_rel: 0.0
+    y_rel: 0.0"""
+        for index in range(pins)
+    )
+    return f"""- name: {name}
+  variant: '{variant}'
+  heuristic: {heuristic}
+  bounding_box:
+    width: {width}
+    height: {height}
+  connection_points:
+{points}
+"""
+
+
+def _write_rich_with_map(
+    path: Path, records: list[str], ref_prefix_map: str
+) -> Path:
+    """Пишет rich-библиотеку с заданной секцией ref_prefix_map."""
+    path.write_text(
+        "ref_prefix_map:\n" + ref_prefix_map + "\nsymbols:\n" + "".join(records),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _symbol_component(ref: str, bbox: tuple[float, ...], pins: int = 2) -> Component:
+    """Компонент с обозначением, bbox и выводами."""
+    return Component(
+        id="c001",
+        type="unknown",
+        ref_designation=ref,
+        x=10.0,
+        y=10.0,
+        pins=[{"id": f"p{index:03d}"} for index in range(pins)],
+        attributes={"bbox": list(bbox), "page": 1},
+        confidence=0.5,
+    )
+
+
+def test_m6_qf_breaker_category_enriches_component(tmp_path: Path) -> None:
+    """M1 плана: QF1 + категория breaker → УГО и вариант по аспекту bbox."""
+    rich = _write_rich_with_map(
+        tmp_path / "rich_qf.yaml",
+        [
+            _rich_record("QFB", "0", "breaker", 4.0, 16.0, pins=2),
+            _rich_record("QFB", "1", "breaker", 8.0, 4.0, pins=2),
+            _rich_record("QA", "0", "breaker", 4.0, 4.0, pins=2),
+        ],
+        "  QF: breaker\n",
+    )
+    library = load_symbols_library(rich)
+    assert library.issues == []
+    assert library.ref_prefix_map == {"QF": "breaker"}
+    component = _symbol_component("QF1", (0.0, 0.0, 8.0, 4.0))
+
+    issues = enrich_components_with_symbol_library([component], library)
+
+    attributes = component.attributes
+    assert attributes["symbol_name"] == "QFB"
+    assert attributes["symbol_variant"] == "1"  # аспект 2.0 как у bbox
+    assert attributes["expected_pin_count"] == 2
+    assert attributes["heuristic"] == "breaker"
+    assert attributes["symbol_match"] == "category"
+    assert issues == []
+
+
+def test_m6_name_list_has_priority_over_category(tmp_path: Path) -> None:
+    """M2 плана: KM: [SCHB] приоритетнее категории switch."""
+    rich = _write_rich_with_map(
+        tmp_path / "rich_km.yaml",
+        [
+            _rich_record("SCHB", "0", "switch", 4.0, 16.0, pins=2),
+            # SCHX геометрически ближе к bbox, но не входит в список имён.
+            _rich_record("SCHX", "0", "switch", 8.0, 4.0, pins=2),
+        ],
+        "  KM: [SCHB]\n",
+    )
+    library = load_symbols_library(rich)
+    assert library.ref_prefix_map == {"KM": ("SCHB",)}
+    component = _symbol_component("KM1", (0.0, 0.0, 8.0, 4.0))
+
+    enrich_components_with_symbol_library([component], library)
+
+    assert component.attributes["symbol_name"] == "SCHB"
+    assert component.attributes["symbol_match"] == "names"
+
+
+def test_m6_exact_name_match_still_wins(tmp_path: Path) -> None:
+    """M3 плана: точное совпадение S1→S сохраняет поведение M5."""
+    rich = _write_rich_with_map(
+        tmp_path / "rich_s.yaml",
+        [
+            _rich_record("S", "0", "switch", 4.0, 16.0, pins=2),
+            _rich_record("OTHER", "0", "switch", 8.0, 4.0, pins=2),
+        ],
+        "  S: [OTHER]\n",
+    )
+    library = load_symbols_library(rich)
+    component = _symbol_component("S1", (0.0, 0.0, 8.0, 4.0))
+
+    enrich_components_with_symbol_library([component], library)
+
+    assert component.attributes["symbol_name"] == "S"
+    assert component.attributes["symbol_match"] == "exact"
+
+
+def test_m6_unknown_prefix_is_not_enriched(tmp_path: Path) -> None:
+    """M4 плана: префикс вне таблицы и библиотеки → без обогащения и issue."""
+    rich = _write_rich_with_map(
+        tmp_path / "rich_other.yaml",
+        [_rich_record("QFB", "0", "breaker", 4.0, 16.0)],
+        "  QF: breaker\n",
+    )
+    library = load_symbols_library(rich)
+    component = _symbol_component("QQ1", (0.0, 0.0, 8.0, 4.0))
+
+    issues = enrich_components_with_symbol_library([component], library)
+
+    assert "symbol_name" not in component.attributes
+    assert issues == []
+
+
+def test_m6_table_available_from_m1_config_without_rich(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Таблица из символов M1-конфига доступна без rich-библиотеки."""
+    external = tmp_path / "symbols.yaml"
+    external.write_text(
+        """ref_prefix_map:
+  QF: breaker
+  KM: [SCHB, SCHL]
+symbols: []
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(SYMBOLS_FILE_ENV, str(external))
+
+    config = load_symbols_config()
+    library = load_symbols_library()
+
+    # Пакетная таблица дополняется внешней (внешняя переопределяет ключи).
+    assert config.ref_prefix_map["QF"] == "breaker"
+    assert config.ref_prefix_map["KM"] == ("SCHB", "SCHL")
+    assert config.ref_prefix_map["XT"] == "terminal"
+    assert config.issues == []
+    assert library.symbols == {}
+
+
+def test_m6_broken_table_reports_issue_and_empty_map(tmp_path: Path) -> None:
+    """Битый ref_prefix_map → symbols_config_error и пустая таблица."""
+    rich = _write_rich_with_map(
+        tmp_path / "rich_broken_map.yaml",
+        [_rich_record("QFB", "0", "breaker", 4.0, 16.0)],
+        "  QF:\n",
+    )
+    library = load_symbols_library(rich)
+
+    assert library.ref_prefix_map == {}
+    assert library.symbols  # записи УГО при этом загружены
+    assert any(issue.type == "symbols_config_error" for issue in library.issues)
+
+
+def test_m6_pipeline_enriches_qf_from_default_table(tmp_path: Path) -> None:
+    """M6 в конвейере: QF1 обогащается категорией breaker из пакетной таблицы."""
+    pdf = _rect_with_ref(tmp_path, "QF1", 30.0, 60.0)
+
+    components, _ = _detect(pdf)
+
+    qf = next(item for item in components if item.ref_designation == "QF1")
+    assert qf.attributes["heuristic"] == "breaker"
+    assert qf.attributes["symbol_match"] == "category"

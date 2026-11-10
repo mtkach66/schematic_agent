@@ -31,8 +31,12 @@ from .spatial import (
 )
 from .symbols_library import (
     LibrarySpec,
+    RefPrefixTarget,
+    SymbolSpec,
+    SymbolVariantSpec,
     detect_symbols_format,
     load_symbols_library,
+    parse_ref_prefix_map,
 )
 
 #: Позиционное обозначение: R1, VD12, KM3, XT1 (1–3 буквы + 1–4 цифры).
@@ -720,11 +724,14 @@ class SymbolConfig:
         templates: Декларативные шаблоны (пакетные + внешние).
         net_aliases: Отображение «нормализованный синоним → каноническая
             нормализованная метка» для M2.
+        ref_prefix_map: Таблица «ref-префикс → категория или имена УГО»
+            для M6 (используется, когда rich-библиотека не задала таблицу).
         issues: Проблемы загрузки (``symbols_config_error``).
     """
 
     templates: list[SymbolTemplateSpec] = field(default_factory=list)
     net_aliases: dict[str, str] = field(default_factory=dict)
+    ref_prefix_map: dict[str, RefPrefixTarget] = field(default_factory=dict)
     issues: list[Issue] = field(default_factory=list)
 
 
@@ -808,8 +815,8 @@ def load_symbols_config() -> SymbolConfig:
 
     Порядок: пакетный ``symbols.yaml`` → внешний файл из
     ``SCHEMATIC_AGENT_SYMBOLS_FILE`` (переопределяет шаблоны с тем же именем,
-    добавляет новые; раздел ``net_aliases`` внешнего файла дополняет и
-    переопределяет пакетный).
+    добавляет новые; разделы ``net_aliases`` и ``ref_prefix_map`` внешнего
+    файла дополняют и переопределяют пакетные).
 
     Битый или отсутствующий файл не прерывает конвейер: формируется
     :class:`Issue` ``symbols_config_error``, конфигурация этого файла
@@ -862,6 +869,12 @@ def load_symbols_config() -> SymbolConfig:
             templates[spec.name] = spec
         aliases = _parse_aliases(raw.get("net_aliases"), path, config.issues)
         config.net_aliases.update(aliases)
+        try:
+            config.ref_prefix_map.update(
+                parse_ref_prefix_map(raw.get("ref_prefix_map"))
+            )
+        except ValueError as error:
+            config.issues.append(_symbols_config_error(path, str(error)))
 
     config.templates = list(templates.values())
     return config
@@ -1174,9 +1187,106 @@ def _pins_for_component(
     return pins, number
 
 
+def _component_bbox_size(component: Component) -> tuple[float, float]:
+    """Возвращает ширину и высоту bbox компонента (0.0, если bbox нет)."""
+    bbox = component.attributes.get("bbox")
+    if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+        return (
+            abs(float(bbox[2]) - float(bbox[0])),
+            abs(float(bbox[3]) - float(bbox[1])),
+        )
+    return 0.0, 0.0
+
+
+def _candidate_specs(
+    library: LibrarySpec,
+    target: RefPrefixTarget | None,
+) -> list[SymbolSpec]:
+    """Возвращает УГО-кандидаты для значения ``ref_prefix_map``.
+
+    Список имён — точные имена, присутствующие в библиотеке (пересечение).
+    Строка-категория — все УГО, у которых ``heuristic`` равен категории.
+    Порядок детерминирован (по имени), чтобы выбор варианта был стабилен.
+
+    Args:
+        library: Rich-библиотека.
+        target: Значение таблицы для префикса или ``None``.
+
+    Returns:
+        Отсортированный список кандидатов (возможно пустой).
+    """
+    if target is None:
+        return []
+    if isinstance(target, str):
+        names = library.category_index.get(target)
+        if names is None:
+            # Библиотека собрана без индекса (нештатный путь) — скан.
+            return sorted(
+                (
+                    spec
+                    for spec in library.symbols.values()
+                    if target in spec.categories
+                ),
+                key=lambda spec: spec.name,
+            )
+        return [
+            library.symbols[name] for name in names if name in library.symbols
+        ]
+    return [
+        library.symbols[name] for name in sorted(set(target))
+        if name in library.symbols
+    ]
+
+
+def _select_symbol_variant(
+    specs: list[SymbolSpec],
+    width: float,
+    height: float,
+) -> tuple[SymbolSpec, SymbolVariantSpec] | None:
+    """Выбирает УГО и вариант, ближайшие по аспекту bbox.
+
+    Аспект (long/short) не зависит от поворота на 90°, поэтому вариант,
+    повёрнутый относительно библиотечного, тоже сопоставляется. При равной
+    близости побеждают имя УГО и номер варианта — результат детерминирован.
+
+    Args:
+        specs: Кандидаты из таблицы/точного совпадения.
+        width: Ширина bbox компонента, pt.
+        height: Высота bbox компонента, pt.
+
+    Returns:
+        Пара «УГО, вариант» или ``None``, если кандидатов нет.
+    """
+    aspect: float | None = None
+    if width > 0.0 and height > 0.0:
+        aspect = max(width, height) / min(width, height)
+    items: list[tuple[SymbolSpec, SymbolVariantSpec]] = []
+    for spec in specs:
+        variant = spec.match_variant(width, height)
+        if variant is not None:
+            items.append((spec, variant))
+    if not items:
+        return None
+
+    def key(
+        item: tuple[SymbolSpec, SymbolVariantSpec],
+    ) -> tuple[float, str, tuple[int, str]]:
+        spec, variant = item
+        if aspect is None:
+            delta = 0.0
+        elif variant.aspect is None:
+            delta = float("inf")
+        else:
+            delta = abs(variant.aspect - aspect)
+        return (delta, spec.name, variant.sort_key)
+
+    return min(items, key=key)
+
+
 def enrich_components_with_symbol_library(
     components: list[Component],
     library: LibrarySpec,
+    ref_prefix_map: dict[str, RefPrefixTarget] | None = None,
 ) -> list[Issue]:
     """Обогащает распознанные компоненты данными rich-библиотеки УГО.
 
@@ -1184,12 +1294,19 @@ def enrich_components_with_symbol_library(
     rich-данные только дополняют ``attributes`` и служат источником
     сверки числа выводов.
 
-    Для компонента с позиционным обозначением берётся префикс (``S1`` →
-    ``S``) и ищется УГО с тем же именем. Вариант выбирается по близости
-    аспекта bbox. В ``attributes`` добавляются ``symbol_name``,
-    ``symbol_variant``, ``expected_pin_count``, ``heuristic`` и
-    ``symbol_categories``. Bbox-фильтр не применяется: единицы библиотеки
-    не совпадают с pt листа.
+    Каскад сопоставления (M5 + M6):
+
+    1. точное совпадение: префикс обозначения (``S1`` → ``S``) равен имени
+       УГО библиотеки (регрессия M5 сохраняется приоритетной);
+    2. иначе ``ref_prefix_map[префикс]``: список имён — пересечение с
+       библиотекой (приоритет), строка-категория — все УГО с этим
+       ``heuristic``;
+    3. вариант выбирается по близости аспекта bbox (поворот 90° не важен).
+
+    В ``attributes`` добавляются ``symbol_name``, ``symbol_variant``,
+    ``expected_pin_count``, ``heuristic``, ``symbol_categories`` и
+    ``symbol_match`` (``exact``/``names``/``category``). Bbox-фильтр не
+    применяется: единицы библиотеки не совпадают с pt листа.
 
     Если rich-библиотека задала ожидаемое число выводов и оно не совпало с
     фактическим, формируется :class:`Issue` ``pin_count_mismatch`` —
@@ -1200,32 +1317,44 @@ def enrich_components_with_symbol_library(
     Args:
         components: Распознанные компоненты (изменяются на месте).
         library: Загруженная rich-библиотека.
+        ref_prefix_map: Таблица M6; по умолчанию — таблица rich-библиотеки.
 
     Returns:
         Список проблем ``pin_count_mismatch``.
     """
+    if ref_prefix_map is None:
+        ref_prefix_map = library.ref_prefix_map
     issues: list[Issue] = []
     for component in components:
         ref_designation = component.ref_designation or ""
         match = _REF_RE.match(ref_designation)
         if not match:
             continue
-        spec = library.get(match.group(1))
-        if spec is None:
+        prefix = match.group(1)
+        width, height = _component_bbox_size(component)
+        selection: tuple[SymbolSpec, SymbolVariantSpec, str] | None = None
+        spec = library.get(prefix)
+        if spec is not None:
+            variant = spec.match_variant(width, height)
+            if variant is not None:
+                selection = (spec, variant, "exact")
+        if selection is None:
+            target = ref_prefix_map.get(prefix)
+            chosen = _select_symbol_variant(
+                _candidate_specs(library, target), width, height
+            )
+            if chosen is not None:
+                match_kind = "names" if isinstance(target, tuple) else "category"
+                selection = (chosen[0], chosen[1], match_kind)
+        if selection is None:
             continue
-        width = height = 0.0
-        bbox = component.attributes.get("bbox")
-        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
-            width = abs(float(bbox[2]) - float(bbox[0]))
-            height = abs(float(bbox[3]) - float(bbox[1]))
-        variant = spec.match_variant(width, height)
-        if variant is None:
-            continue
+        spec, variant, match_kind = selection
         component.attributes["symbol_name"] = spec.name
         component.attributes["symbol_variant"] = variant.variant
         component.attributes["expected_pin_count"] = variant.expected_pin_count
         component.attributes["heuristic"] = variant.heuristic
         component.attributes["symbol_categories"] = sorted(spec.categories)
+        component.attributes["symbol_match"] = match_kind
 
         actual = len(component.pins)
         # heuristic=unknown — категория УГО не подтверждена библиотекой:
@@ -1385,7 +1514,17 @@ def detect_components(
                 )
             )
 
-    issues.extend(enrich_components_with_symbol_library(components, symbol_library))
+    # M6: таблица префиксов — пакетный/внешний M1-конфиг, поверх него
+    # таблица rich-библиотеки (если она её задаёт: rich-файл приоритетнее).
+    ref_prefix_map: dict[str, RefPrefixTarget] = dict(
+        symbol_config.ref_prefix_map
+    )
+    ref_prefix_map.update(symbol_library.ref_prefix_map)
+    issues.extend(
+        enrich_components_with_symbol_library(
+            components, symbol_library, ref_prefix_map
+        )
+    )
     return components, issues
 
 

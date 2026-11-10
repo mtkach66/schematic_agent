@@ -17,6 +17,34 @@
 #
 # Уверенность намеренно консервативна: 0.4–0.6.
 
+# M6: маппинг «ГОСТ ref-префикс проекта → УГО EPLAN».
+# Name-ключи rich-библиотеки (SL, S, SSV…) не совпадают с префиксами
+# позиционных обозначений промышленных проектов (QF, KM, XT…), поэтому
+# точное совпадение срабатывает редко. Таблица включает второй шаг:
+#   QF: breaker          — категория: все записи с heuristic == breaker;
+#   KM: [SCHB, SCHL]     — список имён УГО (приоритет выше категории).
+# Точное совпадение имени с префиксом (S1 → S) всегда проверяется первым.
+# Таблица расширяется внешним файлом SCHEMATIC_AGENT_SYMBOLS_FILE.
+ref_prefix_map:
+  QF: breaker
+  F: fuse
+  FA: fuse
+  FU: fuse
+  M: motor
+  H: lamp
+  HL: lamp
+  X: terminal
+  XT: terminal
+  K: switch
+  KA: switch
+  KM: switch
+  KT: switch
+  KB: switch
+  S: switch
+  SB: switch
+  SA: switch
+  SQ: switch
+
 symbols:
   - name: contactor
     category: contactor
